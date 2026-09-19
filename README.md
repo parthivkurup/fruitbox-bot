@@ -46,9 +46,14 @@ dragging and re-reading are paid for - over 60 random boards plus the fixture:
 | rollout (plain) | 126.7 | 126 | 89 | 151 | 140 |
 | **rollout (tuned)** | **135.7** | 136 | 96 | 167 | **150** |
 
-Live games land in the same place: the last headed run cleared 137 of 170 in
-118 of the 120 seconds, finishing because the board ran dry rather than because
-the clock did.
+Live games land in the same place: a headed run cleared 137 of 170 in 118 of the
+120 seconds, finishing because the board ran dry rather than because the clock
+did.
+
+When the bot finishes early it waits out the rest of the game clock so the game
+reveals its own Score screen, then leaves the window open until you press Enter.
+That screen is also a free check on the vision pipeline: on the last run it read
+`Score 124` against the bot's own count of 124 apples cleared.
 
 Clearing few apples at a time is the whole game: a two-apple clear opens gaps
 that let later rectangles reach across the board, whereas a big clear spends
@@ -94,6 +99,7 @@ python bot.py --dry-run          # read the board, print the plan, drag nothing
 python bot.py                    # play for real
 python bot.py --debug            # also write annotated screenshots to debug/
 python bot.py --headless         # no visible window (useful for testing)
+python bot.py --hold 10          # close after 10s instead of waiting on Enter
 python benchmark.py              # compare strategies, 200 random boards
 python benchmark.py --boards 60 --total-budget 60   # as the live bot plays
 python -m pytest                 # unit tests

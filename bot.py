@@ -327,6 +327,7 @@ def run_dry(args: argparse.Namespace) -> None:
                   f"{session.to_page(x1, y1)}")
         if args.debug:
             save_debug(image, reading, result.moves[0] if result.moves else None, 0)
+        hold_window(session, args)
 
 
 def run_play(args: argparse.Namespace) -> None:
@@ -393,15 +394,51 @@ def run_play(args: argparse.Namespace) -> None:
         session.page.wait_for_timeout(500)      # let the last clear finish
         image = session.screenshot()
         final = vision.read_board(image, cal, reader)
+        # Counting apples off the board is what the game itself scores; the
+        # move-by-move tally can drift by a point or two when a drag is retried.
         cleared = solver.ROWS * solver.COLS - final.apples
-        print(f"\nfinished: {played} moves, {cleared} apples cleared "
-              f"(tracked score {score}) in {time.perf_counter() - started:.1f}s")
+        drift = "" if score == cleared else f" (running tally said {score})"
+        print(f"\nfinished: {played} moves, scored {cleared}{drift} "
+              f"in {time.perf_counter() - started:.1f}s")
         if args.debug:
             save_debug(image, final, None, 999)
-        if args.hold:
-            print(f"holding the window open for {args.hold}s")
-            assert session.page is not None
-            session.page.wait_for_timeout(int(args.hold * 1000))
+
+        if not args.headless:
+            wait_out_clock(session, deadline)
+            if args.debug:
+                DEBUG_DIR.mkdir(exist_ok=True)
+                cv2.imwrite(str(DEBUG_DIR / "score_screen.png"),
+                            session.screenshot(lossless=True))
+        hold_window(session, args)
+
+
+def wait_out_clock(session: GameSession, deadline: float) -> None:
+    """Let the game's own 120s clock expire so it shows its Score screen.
+
+    The bot usually plays the board dry with time to spare, and the game only
+    reveals the score once the clock runs out.
+    """
+    left = deadline - time.perf_counter()
+    if left <= 0:
+        return
+    print(f"waiting {left:.0f}s for the game clock, so the score screen appears")
+    assert session.page is not None
+    session.page.wait_for_timeout(int(left * 1000) + 1500)
+
+
+def hold_window(session: GameSession, args: argparse.Namespace) -> None:
+    """Leave the finished game on screen instead of closing the browser."""
+    if args.headless:
+        return
+    assert session.page is not None
+    if args.hold:
+        print(f"holding the window open for {args.hold:.0f}s")
+        session.page.wait_for_timeout(int(args.hold * 1000))
+        return
+    try:
+        input("\npress Enter to close the browser ")
+    except (EOFError, KeyboardInterrupt):      # not attached to a terminal
+        pass
 
 
 def load_calibration(detected: vision.Calibration, recalibrate: bool) -> vision.Calibration:
@@ -447,7 +484,8 @@ def main() -> None:
                         help="initial estimate of drag + re-read seconds per move")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hold", type=float, default=0.0,
-                        help="keep the browser open this long after the game")
+                        help="close the browser after this many seconds instead of "
+                             "waiting for you to press Enter")
     args = parser.parse_args()
     (run_dry if args.dry_run else run_play)(args)
 
