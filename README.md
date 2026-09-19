@@ -37,6 +37,19 @@ Scores are apples cleared, out of 170.
 
 (200 random boards, 50ms of thinking per move.)
 
+Given the thinking time a real game actually affords - about 60 seconds, once
+dragging and re-reading are paid for - over 60 random boards plus the fixture:
+
+| strategy | mean | median | min | max | fixture |
+| --- | --- | --- | --- | --- | --- |
+| greedy-fewest | 112.0 | 112 | 74 | 134 | 115 |
+| rollout (plain) | 126.7 | 126 | 89 | 151 | 140 |
+| **rollout (tuned)** | **135.7** | 136 | 96 | 167 | **150** |
+
+Live games land in the same place: the last headed run cleared 137 of 170 in
+118 of the 120 seconds, finishing because the board ran dry rather than because
+the clock did.
+
 Clearing few apples at a time is the whole game: a two-apple clear opens gaps
 that let later rectangles reach across the board, whereas a big clear spends
 several apples to buy one move's worth of progress. Every strategy that scores
@@ -100,6 +113,13 @@ found the hard way:
   400ms the drag was dropped, so the bot retries rather than waiting.
 - Canvas captures use JPEG, which is about 3x faster than PNG (33ms vs 92ms)
   and parses to the same board. Calibration uses PNG.
+
+The bot keeps its own model of the board and re-reads the screen to stay honest.
+After every move it counts apples (cheap - no digit matching) to confirm the
+clear happened, and re-parses the digits on the interval set by
+`--reread-every`, adopting what the screen says over what it expected. If any
+digit matches weakly it keeps the tracked board instead, so one bad read cannot
+derail the game.
 
 ## Calibrating
 
