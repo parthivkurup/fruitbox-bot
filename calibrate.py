@@ -13,6 +13,8 @@ answers are written to ``templates/<digit>.png`` and the geometry to
 
 from __future__ import annotations
 
+import _env  # noqa: F401  checks the venv before the imports below
+
 import argparse
 from pathlib import Path
 

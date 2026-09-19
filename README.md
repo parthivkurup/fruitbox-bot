@@ -83,6 +83,10 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+Everything below assumes that venv is active. If it is not, the scripts say so
+rather than failing on a missing import - or skip activating and call
+`.venv/bin/python` directly.
+
 ## Running
 
 ```bash

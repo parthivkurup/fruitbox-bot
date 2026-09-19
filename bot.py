@@ -7,6 +7,8 @@ animation. Stops when no legal move remains or the 120 second clock runs out.
 
 from __future__ import annotations
 
+import _env  # noqa: F401  checks the venv before the imports below
+
 import argparse
 import random
 import time

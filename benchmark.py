@@ -8,6 +8,8 @@ Examples::
 
 from __future__ import annotations
 
+import _env  # noqa: F401  checks the venv before the imports below
+
 import argparse
 import multiprocessing as mp
 import random
