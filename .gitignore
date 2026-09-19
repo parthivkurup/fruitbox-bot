@@ -19,3 +19,4 @@ screenshots/
 debug/
 cells/
 *.log
+templates/_clusters.png
