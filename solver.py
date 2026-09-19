@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import NamedTuple, Protocol, Sequence
 
 import numpy as np
 
@@ -20,39 +20,14 @@ TARGET: int = 10
 Board = np.ndarray  # shape (ROWS, COLS), integer dtype, 0 == empty
 
 
-class Move(Sequence):
+class Move(NamedTuple):
     """An axis-aligned rectangle of cells, inclusive on both ends."""
 
-    __slots__ = ("r1", "c1", "r2", "c2", "apples")
-
-    def __init__(self, r1: int, c1: int, r2: int, c2: int, apples: int) -> None:
-        self.r1 = r1
-        self.c1 = c1
-        self.r2 = r2
-        self.c2 = c2
-        self.apples = apples  # non-empty cells cleared == points scored
-
-    def __getitem__(self, i: int):  # lets a Move unpack like a tuple
-        return (self.r1, self.c1, self.r2, self.c2, self.apples)[i]
-
-    def __len__(self) -> int:
-        return 5
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, Move):
-            return tuple(self) == tuple(other)
-        if isinstance(other, tuple):
-            return tuple(self) == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(tuple(self))
-
-    def __repr__(self) -> str:
-        return (
-            f"Move(r{self.r1}-{self.r2}, c{self.c1}-{self.c2}, "
-            f"{self.apples} apples)"
-        )
+    r1: int
+    c1: int
+    r2: int
+    c2: int
+    apples: int          # non-empty cells cleared == points scored
 
     @property
     def height(self) -> int:
@@ -61,6 +36,9 @@ class Move(Sequence):
     @property
     def width(self) -> int:
         return self.c2 - self.c1 + 1
+
+
+Rect = tuple[int, int, int, int]        # (r1, c1, r2, c2), without the count
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +240,11 @@ class RandomPolicy:
             return 0
         if self.alpha == 0.0:
             return rng.randrange(hits.size)
-        cum = np.cumsum(self.weights[apples])
+        weights = self.weights[apples]
+        # Rescale so the best move always weighs 1: at large alpha the raw
+        # weights underflow to zero and the draw would degenerate.
+        weights = weights / weights.max()
+        cum = np.cumsum(weights)
         return int(np.searchsorted(cum, rng.random() * cum[-1]))
 
     def pick(self, moves: list[Move], rng: random.Random) -> Move:
@@ -273,8 +255,17 @@ class RandomPolicy:
         return rng.choices(moves, weights=weights, k=1)[0]
 
 
-def _playout(board: Board, policy: RandomPolicy, rng: random.Random) -> int:
-    """Play a board to the end with ``policy``; return apples cleared."""
+def _playout(
+    board: Board,
+    policy: RandomPolicy,
+    rng: random.Random,
+    record: list[Rect] | None = None,
+) -> int:
+    """Play a board to the end with ``policy``; return apples cleared.
+
+    Apples cleared is just the drop in the apple count, so no per-move
+    bookkeeping is needed unless the caller wants the sequence itself.
+    """
     work = board.copy()
     before = int((work > 0).sum())
     while True:
@@ -283,63 +274,173 @@ def _playout(board: Board, policy: RandomPolicy, rng: random.Random) -> int:
             return before - int((work > 0).sum())
         k = policy._pick_index(hits, apples, rng)
         i, j = divmod(int(hits[k]), _NC)
+        if record is not None:
+            record.append((int(_R1[i]), int(_C1[j]), int(_R2[i]), int(_C2[j])))
         work[_R1[i] : _R2P1[i], _C1[j] : _C2P1[j]] = 0
+
+
+def replay(board: Board, line: Sequence[Rect]) -> int | None:
+    """Score a remembered line on ``board``, or None if it no longer plays."""
+    work = board.copy()
+    total = 0
+    for r1, c1, r2, c2 in line:
+        block = work[r1 : r2 + 1, c1 : c2 + 1]
+        if int(block.sum()) != TARGET:
+            return None
+        total += int((block > 0).sum())
+        block[:] = 0
+    return total
 
 
 @dataclass
 class Rollout:
     """Main strategy: randomised greedy playouts, commit the best first move.
 
-    Each iteration picks a candidate first move (round-robin over all legal
-    moves), plays the rest of the game out with ``policy``, and keeps the first
-    move of the highest-scoring playout seen.
+    Two refinements over plain round-robin rollouts:
+
+    *Line memory* - the best playout found is kept whole. After committing its
+    first move the rest is replayed as the next search's starting bid, so search
+    can only ever improve on what it already found.
+
+    *Sequential halving* - splitting the budget evenly over 50-odd candidate
+    first moves wastes most of it on obvious losers. Instead the candidates are
+    played in rounds and the worse half is dropped each round, concentrating the
+    budget on the moves still in contention.
     """
 
-    time_budget: float = 0.5          # seconds per move
+    time_budget: float = 0.5            # per-move think time cap (s)
+    total_budget: float | None = None   # whole-game think time, split per move
     max_playouts: int = 1_000_000
-    min_playouts: int = 1             # at least this many rounds per candidate
-    alpha: float = 2.0
+    alpha: float = 12.0                 # tuned; see README
+    keep_line: bool = True
+    halving: bool = True
+    floor: float = 0.02
     name: str = "rollout"
 
     def __post_init__(self) -> None:
         self.policy = RandomPolicy(alpha=self.alpha)
-        self.last_playouts: int = 0
+        self.reset()
+
+    def reset(self) -> None:
+        """Start a new game: clear the line memory and the game clock."""
+        self.line: list[Rect] = []
+        self.played = 0
+        self.playouts = 0
+        self.playout_cost = 1e-3        # seconds, refined as we go
+        self.deadline: float | None = (
+            time.perf_counter() + self.total_budget if self.total_budget else None
+        )
+
+    # -- budgeting --------------------------------------------------------
+
+    def _budget(self, board: Board) -> float:
+        """Think time for this move, honouring any whole-game budget."""
+        if self.deadline is None:
+            return self.time_budget
+        left = self.deadline - time.perf_counter()
+        moves_left = max(3.0, min(62.0 - self.played,
+                                  remaining_apples(board) / 2.1))
+        return max(self.floor, min(self.time_budget, left / moves_left))
+
+    # -- search -----------------------------------------------------------
 
     def choose(self, board: Board, rng: random.Random) -> Move | None:
         hits, apples = _move_arrays(board)
         n = hits.size
         if n == 0:
             return None
+        self.played += 1
         if n == 1:
+            self.line = []
             return _move_from_flat(int(hits[0]), int(apples[0]))
 
-        deadline = time.perf_counter() + self.time_budget
-        best_index = 0
+        deadline = time.perf_counter() + self._budget(board)
+
+        # Starting bid: whatever the remembered line is still worth.
+        best: list[Rect] = []
         best_score = -1
-        playouts = 0
-        floor = self.min_playouts * n
-        while playouts < self.max_playouts:
-            if playouts >= floor and time.perf_counter() >= deadline:
-                break
-            k = playouts % n
-            playouts += 1
-            i, j = divmod(int(hits[k]), _NC)
-            child = board.copy()
-            child[_R1[i] : _R2P1[i], _C1[j] : _C2P1[j]] = 0
-            total = int(apples[k]) + _playout(child, self.policy, rng)
-            if total > best_score:
-                best_score, best_index = total, k
-        self.last_playouts = playouts
-        return _move_from_flat(int(hits[best_index]), int(apples[best_index]))
+        if self.keep_line and self.line:
+            carried = replay(board, self.line)
+            if carried is not None:
+                best, best_score = list(self.line), carried
+
+        # A playout costs about a millisecond. If the budget cannot cover one
+        # per candidate there is nothing to halve, so fall back to trying the
+        # smallest clears - the same bias the rollout policy uses.
+        affordable = max(1, int((deadline - time.perf_counter()) / self.playout_cost))
+        if self.halving and affordable >= n:
+            alive = list(range(n))
+            rounds = max(1, (n - 1).bit_length())
+        else:
+            alive = [int(k) for k in np.argsort(apples, kind="stable")[:affordable]]
+            rounds = 1
+
+        scores: dict[int, int] = {k: -1 for k in alive}
+        lines: dict[int, list[Rect]] = {}
+        children: dict[int, Board] = {}
+        for round_index in range(rounds):
+            share = (deadline - time.perf_counter()) / (rounds - round_index)
+            stop = time.perf_counter() + share
+            while True:
+                started = time.perf_counter()
+                for k in alive:
+                    if k not in children:
+                        children[k] = self._child(board, hits, k)
+                    record: list[Rect] = []
+                    total = int(apples[k]) + _playout(
+                        children[k], self.policy, rng, record
+                    )
+                    self.playouts += 1
+                    if total > scores[k]:
+                        scores[k] = total
+                        lines[k] = [self._rect(hits, k), *record]
+                    if total > best_score:
+                        best_score, best = total, lines[k]
+                now = time.perf_counter()
+                self.playout_cost = (0.9 * self.playout_cost
+                                     + 0.1 * (now - started) / len(alive))
+                if now >= stop or self.playouts >= self.max_playouts:
+                    break
+            if len(alive) > 1:
+                alive.sort(key=lambda k: -scores[k])
+                alive = alive[: max(1, len(alive) // 2)]
+
+        if not best:
+            best = lines.get(alive[0], [self._rect(hits, alive[0])])
+        self.line = best[1:] if self.keep_line else []
+        r1, c1, r2, c2 = best[0]
+        return Move(r1, c1, r2, c2, count_apples(board, Move(r1, c1, r2, c2, 0)))
+
+    @staticmethod
+    def _rect(hits: np.ndarray, k: int) -> Rect:
+        i, j = divmod(int(hits[k]), _NC)
+        return int(_R1[i]), int(_C1[j]), int(_R2[i]), int(_C2[j])
+
+    @staticmethod
+    def _child(board: Board, hits: np.ndarray, k: int) -> Board:
+        i, j = divmod(int(hits[k]), _NC)
+        child = board.copy()
+        child[_R1[i] : _R2P1[i], _C1[j] : _C2P1[j]] = 0
+        return child
 
 
 @dataclass
 class Beam:
-    """Beam search over whole-game lines, committing the best first move."""
+    """Beam search over whole-game lines, committing the best first move.
+
+    Kept for comparison only. Ranking partial lines by apples cleared so far
+    rewards big early clears, which is exactly the wrong instinct; adding a
+    mobility term (how many moves the position still offers) helps a lot but
+    beam still loses to plain greedy, let alone to rollouts. See the README.
+    """
 
     width: int = 24
     time_budget: float = 1.0
+    mobility: float = 0.3      # weight on moves still available
     name: str = "beam"
+
+    def _rank(self, entry: tuple[int, "Board", Move]) -> float:
+        return -(entry[0] + self.mobility * count_moves(entry[1]))
 
     def choose(self, board: Board, rng: random.Random) -> Move | None:
         moves = generate_moves(board)
@@ -353,9 +454,10 @@ class Beam:
         beam: list[tuple[int, Board, Move]] = [
             (m.apples, apply_move(board, m), m) for m in moves
         ]
-        beam.sort(key=lambda e: -e[0])
+        beam.sort(key=self._rank)
         beam = beam[: self.width]
-        best_score, best_move = beam[0][0], beam[0][2]
+        best = max(beam, key=lambda e: e[0])
+        best_score, best_move = best[0], best[2]
 
         while beam and time.perf_counter() < deadline:
             children: list[tuple[int, Board, Move]] = []
@@ -370,7 +472,7 @@ class Beam:
                     children.append((score + m.apples, child, first))
             if not children:
                 break
-            children.sort(key=lambda e: -e[0])
+            children.sort(key=self._rank)
             beam = children[: self.width]
             if beam[0][0] > best_score:
                 best_score, best_move = beam[0][0], beam[0][2]
@@ -393,7 +495,7 @@ class SimResult:
 
     @property
     def time_per_move(self) -> float:
-        return self.elapsed / self.moves.__len__() if self.moves else 0.0
+        return self.elapsed / len(self.moves) if self.moves else 0.0
 
 
 def simulate(
@@ -406,6 +508,9 @@ def simulate(
 ) -> SimResult:
     """Play ``board`` to the end with ``strategy`` and report the final score."""
     rng = rng or random.Random(0)
+    reset = getattr(strategy, "reset", None)
+    if callable(reset):
+        reset()
     work = board.copy()
     played: list[Move] = []
     score = 0

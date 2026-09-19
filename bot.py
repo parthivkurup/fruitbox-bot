@@ -284,6 +284,16 @@ def make_strategy(name: str, budget: float, alpha: float) -> solver.Strategy:
     raise ValueError(f"unknown strategy {name!r}")
 
 
+def set_budget(strategy: solver.Strategy, budget: float) -> None:
+    """Retune a *live* strategy's think time.
+
+    The strategy must outlive the loop - rebuilding it each move would throw
+    away the remembered line, which is most of what makes rollouts good.
+    """
+    if hasattr(strategy, "time_budget"):
+        strategy.time_budget = budget
+
+
 # --------------------------------------------------------------------------
 # Modes
 # --------------------------------------------------------------------------
@@ -335,9 +345,14 @@ def run_play(args: argparse.Namespace) -> None:
         score = 0
         played = 0
         overhead = args.overhead          # seconds of drag + re-read per move
+        strategy = make_strategy(args.strategy, args.budget, args.alpha)
+        reset = getattr(strategy, "reset", None)
+        if callable(reset):
+            reset()
         while time.perf_counter() < deadline - END_RESERVE:
-            budget = think_budget(deadline, board, played, overhead, args.floor)
-            strategy = make_strategy(args.strategy, min(budget, args.budget), args.alpha)
+            budget = min(think_budget(deadline, board, played, overhead, args.floor),
+                         args.budget)
+            set_budget(strategy, budget)
             move = strategy.choose(board, rng)
             if move is None:
                 print("no legal moves left")
@@ -420,7 +435,7 @@ def main() -> None:
                         help="upper bound on per-move think time (s)")
     parser.add_argument("--floor", type=float, default=0.02,
                         help="lower bound on per-move think time (s)")
-    parser.add_argument("--alpha", type=float, default=2.0,
+    parser.add_argument("--alpha", type=float, default=12.0,
                         help="rollout policy bias towards small clears")
     parser.add_argument("--reread-every", type=int, default=1,
                         help="re-read the board every N moves")

@@ -159,7 +159,7 @@ STRATEGIES = [
     solver.GreedyFewest(),
     solver.GreedyMost(),
     solver.RandomPolicy(alpha=2.0),
-    solver.Rollout(time_budget=0.02, min_playouts=1),
+    solver.Rollout(time_budget=0.02),
     solver.Beam(width=4, time_budget=0.05),
 ]
 
@@ -217,9 +217,44 @@ def test_score_is_bounded_by_the_board(real_board: solver.Board) -> None:
     assert 0 < result.score <= ROWS * COLS
 
 
-def test_rollout_beats_or_matches_nothing_and_is_deterministic_per_seed(
-    real_board: solver.Board,
-) -> None:
-    strategy = solver.Rollout(time_budget=0.05, min_playouts=2)
-    a = solver.simulate(real_board, strategy, random.Random(42)).score
-    assert a > 0
+def test_rollout_scores_on_the_real_board(real_board: solver.Board) -> None:
+    strategy = solver.Rollout(time_budget=0.05)
+    assert solver.simulate(real_board, strategy, random.Random(42)).score > 0
+
+
+def test_rollout_reset_clears_line_memory(real_board: solver.Board) -> None:
+    strategy = solver.Rollout(time_budget=0.05)
+    solver.simulate(real_board, strategy, random.Random(1))
+    assert strategy.played > 0
+    strategy.reset()
+    assert strategy.line == [] and strategy.played == 0
+
+
+def test_rollout_respects_a_whole_game_budget(real_board: solver.Board) -> None:
+    strategy = solver.Rollout(time_budget=5.0, total_budget=1.0)
+    result = solver.simulate(real_board, strategy, random.Random(1))
+    assert result.elapsed < 3.0     # budget plus the last move's overshoot
+    assert result.score > 0
+
+
+def test_replay_scores_a_line_and_rejects_a_stale_one() -> None:
+    board = np.zeros((ROWS, COLS), dtype=np.int8)
+    board[0, 0], board[0, 1] = 4, 6
+    board[5, 5], board[5, 6] = 3, 7
+    assert solver.replay(board, [(0, 0, 0, 1), (5, 5, 5, 6)]) == 4
+    assert solver.replay(board, [(0, 0, 0, 1), (0, 0, 0, 1)]) is None
+    assert solver.replay(board, [(0, 0, 0, 0)]) is None
+
+
+def test_remembered_line_is_actually_playable(real_board: solver.Board) -> None:
+    """Whatever the strategy carries forward must replay on the live board."""
+    strategy = solver.Rollout(time_budget=0.05)
+    rng = random.Random(3)
+    strategy.reset()
+    board = real_board.copy()
+    for _ in range(6):
+        move = strategy.choose(board, rng)
+        assert move is not None and solver.is_legal(board, move)
+        solver.apply_move(board, move, inplace=True)
+        if strategy.line:
+            assert solver.replay(board, strategy.line) is not None

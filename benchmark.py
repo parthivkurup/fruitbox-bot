@@ -23,15 +23,24 @@ import solver
 FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "board_real.txt"
 
 
-def build_strategies(budget: float) -> dict[str, solver.Strategy]:
-    """Strategy line-up; ``budget`` is the per-move think time in seconds."""
+def build_strategies(
+    budget: float, total: float | None = None
+) -> dict[str, solver.Strategy]:
+    """Strategy line-up.
+
+    ``budget`` caps think time per move. ``total``, if given, is a whole-game
+    think budget the rollout splits across its moves exactly as the live bot
+    does - the honest way to compare against the 120 second clock.
+    """
     return {
         "greedy-fewest": solver.GreedyFewest(),
         "greedy-most": solver.GreedyMost(),
         "random-uniform": solver.RandomPolicy(alpha=0.0),
-        "random-biased": solver.RandomPolicy(alpha=2.0),
-        "rollout": solver.Rollout(time_budget=budget, alpha=2.0),
+        "random-biased": solver.RandomPolicy(alpha=12.0),
         "beam": solver.Beam(width=24, time_budget=budget),
+        "rollout-plain": solver.Rollout(time_budget=budget, total_budget=total,
+                                        alpha=2.0, keep_line=False, halving=False),
+        "rollout": solver.Rollout(time_budget=budget, total_budget=total),
     }
 
 
@@ -42,9 +51,9 @@ class Run:
     elapsed: float
 
 
-def _play(args: tuple[str, float, np.ndarray, int]) -> Run:
-    name, budget, board, seed = args
-    strategy = build_strategies(budget)[name]
+def _play(args: tuple[str, float, float | None, np.ndarray, int]) -> Run:
+    name, budget, total, board, seed = args
+    strategy = build_strategies(budget, total)[name]
     result = solver.simulate(board, strategy, random.Random(seed))
     return Run(result.score, result.move_count, result.elapsed)
 
@@ -68,12 +77,18 @@ def main() -> None:
     parser.add_argument("--boards", type=int, default=200, help="random boards per strategy")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=float, default=0.05,
-                        help="per-move think time (s) for rollout/beam")
+                        help="cap on per-move think time (s) for rollout/beam")
+    parser.add_argument("--total-budget", type=float, default=None,
+                        help="whole-game think budget (s); ~60 matches the live bot. "
+                             "Raises the per-move cap unless --budget is given too")
     parser.add_argument("--only", nargs="*", help="subset of strategy names")
     parser.add_argument("--jobs", type=int, default=mp.cpu_count() - 1)
     args = parser.parse_args()
+    if args.total_budget and args.budget == parser.get_default("budget"):
+        # Otherwise the per-move cap silently swallows the whole-game budget.
+        args.budget = args.total_budget / 8
 
-    names = list(build_strategies(args.budget))
+    names = list(build_strategies(args.budget, args.total_budget))
     if args.only:
         unknown = set(args.only) - set(names)
         if unknown:
@@ -84,7 +99,9 @@ def main() -> None:
     boards = [solver.random_board(rng) for _ in range(args.boards)]
     fixture = solver.parse_board(FIXTURE.read_text())
 
-    print(f"{args.boards} random boards + fixture | per-move budget {args.budget}s "
+    how = (f"whole-game budget {args.total_budget}s" if args.total_budget
+           else f"per-move budget {args.budget}s")
+    print(f"{args.boards} random boards + fixture | {how} "
           f"| jobs {args.jobs} | max score {solver.ROWS * solver.COLS}")
     print(f"{'strategy':<15} {'mean':>7} {'median':>7} {'min':>6} {'max':>6} "
           f"{'stdev':>6} {'ms/move':>9} {'moves':>7} {'s/game':>8} {'fixture':>8}")
@@ -92,8 +109,9 @@ def main() -> None:
 
     started = time.perf_counter()
     for name in names:
-        fixture_run = _play((name, args.budget, fixture, args.seed))
-        jobs = [(name, args.budget, b, args.seed + i) for i, b in enumerate(boards)]
+        fixture_run = _play((name, args.budget, args.total_budget, fixture, args.seed))
+        jobs = [(name, args.budget, args.total_budget, b, args.seed + i)
+                for i, b in enumerate(boards)]
         if args.jobs > 1:
             with mp.Pool(args.jobs) as pool:
                 runs = pool.map(_play, jobs)
