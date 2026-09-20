@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -117,3 +118,39 @@ def test_default_budgets_fit_inside_the_time_limit() -> None:
 
 def test_verify_every_is_positive() -> None:
     assert _args().verify_every >= 1
+
+
+# --------------------------------------------------------------------------
+# Divergence reporting
+# --------------------------------------------------------------------------
+
+def test_describe_diff_lists_expected_and_observed() -> None:
+    expected = np.zeros((solver.ROWS, solver.COLS), dtype=np.int8)
+    observed = expected.copy()
+    observed[2, 3] = 7
+    assert bot.describe_diff(expected, observed) == [(2, 3, 0, 7)]
+    assert bot.describe_diff(expected, expected) == []
+
+
+def test_classify_names_the_three_failure_modes() -> None:
+    move = solver.Move(1, 1, 1, 2, 2)
+    assert bot.classify(move, []) == "none"
+    # Target apples still on screen: the game never saw the drag.
+    dropped = [(1, 1, 0, 4), (1, 2, 0, 6)]
+    assert bot.classify(move, dropped).startswith("dropped drag")
+    # A cell outside the rectangle changed: the box took in a neighbour.
+    geometry = [(1, 3, 5, 0)]
+    assert bot.classify(move, geometry).startswith("drag geometry")
+    # A cell holds a different digit than we thought: the parse was wrong.
+    # This is checked before geometry - such a cell can be anywhere.
+    misread = [(4, 4, 3, 8)]
+    assert bot.classify(move, misread).startswith("vision misread")
+
+
+def test_affordable_moves_respects_the_clock() -> None:
+    moves = [solver.Move(0, 0, 0, 1, 2)] * 60
+    now = time.perf_counter()
+    assert bot.affordable_moves(moves, now + 100.0, 1.0) == 60   # all of them fit
+    # A shade under 20 because the clock moves while the call is made.
+    assert bot.affordable_moves(moves, now + 20.0, 1.0) in (19, 20)
+    assert bot.affordable_moves(moves, now - 1.0, 1.0) == 0      # already over

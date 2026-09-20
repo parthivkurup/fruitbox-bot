@@ -113,3 +113,62 @@ def test_annotate_draws_without_changing_the_original(
     out = vision.annotate(canvas, reading, move, "test")
     assert np.array_equal(canvas, before)
     assert not np.array_equal(out, canvas)
+
+
+# --------------------------------------------------------------------------
+# The flying score badge
+# --------------------------------------------------------------------------
+
+BADGE = FIXTURES / "canvas_badge.jpg"
+
+
+@pytest.fixture(scope="module")
+def badge_frame() -> np.ndarray:
+    image = cv2.imread(str(BADGE))
+    assert image is not None, f"missing fixture {BADGE}"
+    return image
+
+
+def test_a_settled_board_has_no_yellow_at_all(canvas: np.ndarray) -> None:
+    """The badge detector relies on yellow being unique to the badge."""
+    assert int(vision.yellow_mask(canvas).sum()) == 0
+    assert not vision.popup_present(canvas)
+
+
+def test_badge_frame_is_detected(badge_frame: np.ndarray) -> None:
+    assert int(vision.yellow_mask(badge_frame).sum()) > vision.POPUP_MIN_PIXELS
+    assert vision.popup_present(badge_frame)
+
+
+def test_badge_corrupts_the_cell_it_covers(
+    badge_frame: np.ndarray, reader: vision.DigitReader
+) -> None:
+    """Why frames with a badge must never be parsed.
+
+    The badge is flying over row 0 in this frame, and the cell underneath it
+    reads as empty even though the apple is still there.
+    """
+    cal = vision.Calibration.load()
+    reading = vision.read_board(badge_frame, cal, reader)
+    covered = reading.board[0, 11]
+    assert covered == 0, "fixture should show the badge blanking cell (0, 11)"
+
+
+# --------------------------------------------------------------------------
+# The on-screen score counter
+# --------------------------------------------------------------------------
+
+def test_reads_the_score_counter(badge_frame: np.ndarray, canvas: np.ndarray) -> None:
+    score_reader = vision.ScoreReader.load()
+    assert vision.read_score(canvas, score_reader) == 0        # fresh board
+    assert vision.read_score(badge_frame, score_reader) == 2   # after one clear
+
+
+def test_score_reader_needs_every_digit() -> None:
+    score_reader = vision.ScoreReader.load()
+    assert set(score_reader.templates) == set(vision.SCORE_DIGITS)
+
+
+def test_score_reader_reports_missing_templates(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        vision.ScoreReader.load(tmp_path)

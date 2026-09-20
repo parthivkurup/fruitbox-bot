@@ -27,6 +27,17 @@ TEMPLATES_DIR = ROOT / "templates"
 
 GLYPH_SIZE = (24, 32)          # (width, height) every glyph is normalised to
 DIGITS = tuple(range(1, 10))
+SCORE_DIGITS = tuple(range(10))
+SCORE_GLYPH_SIZE = (16, 24)
+
+# When apples clear, the game flies a "+N" badge from them to the score counter.
+# It is drawn over the board and wrecks any cell it passes, so frames containing
+# one must not be parsed. The badge has a yellow outline and nothing else on the
+# board is yellow at all, which makes it trivial to spot.
+POPUP_MIN_PIXELS = 40
+
+# The score counter, as fractions of the canvas so it survives rescaling.
+SCORE_BOX = (1250 / 1440, 95 / 940, 1355 / 1440, 155 / 940)
 
 # An apple covers roughly half of its cell crop; a cleared cell has no red at
 # all. The midpoint is a wide, safe margin.
@@ -85,6 +96,21 @@ def red_mask(image: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     return (((hue < 12) | (hue > 168)) & (sat > 100) & (val > 100)).astype(np.uint8)
+
+
+def yellow_mask(image: np.ndarray) -> np.ndarray:
+    """1 where a pixel belongs to the flying score badge."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    return ((hue >= 20) & (hue <= 35) & (sat > 120) & (val > 150)).astype(np.uint8)
+
+
+def popup_present(image: np.ndarray, min_pixels: int = POPUP_MIN_PIXELS) -> bool:
+    """True if a score badge is in flight over the board.
+
+    A settled board has no yellow pixels at all, so this is a clean test.
+    """
+    return int(yellow_mask(image).sum()) >= min_pixels
 
 
 def _bands(projection: np.ndarray, threshold: float) -> list[tuple[int, int]]:
@@ -284,6 +310,89 @@ def read_board(
             scores[r, c] = score
     return BoardReading(board, scores, fractions,
                         cal.rescaled(image.shape[1], image.shape[0]))
+
+
+# --------------------------------------------------------------------------
+# The on-screen score counter
+# --------------------------------------------------------------------------
+
+def score_mask(image: np.ndarray) -> np.ndarray:
+    """Binary mask of the score digits, cropped to the counter."""
+    h, w = image.shape[:2]
+    x0, y0, x1, y1 = SCORE_BOX
+    box = image[int(y0 * h) : int(y1 * h), int(x0 * w) : int(x1 * w)]
+    hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # Inside this crop the only saturated green is the counter itself - the
+    # bright frame and the timer bar both fall outside it - so the value range
+    # only has to be loose enough to cover the counter's own antialiasing.
+    solid = (hue >= 35) & (hue <= 85) & (sat > 120) & (val > 60) & (val < 245)
+    return solid.astype(np.uint8) * 255
+
+
+def score_glyphs(image: np.ndarray) -> list[np.ndarray]:
+    """The counter's digits, left to right, normalised for matching."""
+    mask = score_mask(image)
+    columns = mask.any(axis=0)
+    glyphs = []
+    for start, end in _bands(columns.astype(np.uint8), 0):
+        column = mask[:, start : end + 1]
+        rows = np.nonzero(column.any(axis=1))[0]
+        if rows.size < 6 or (end - start) < 2:
+            continue
+        glyph = column[rows.min() : rows.max() + 1]
+        glyphs.append(cv2.resize(glyph, SCORE_GLYPH_SIZE, interpolation=cv2.INTER_AREA))
+    return glyphs
+
+
+class ScoreReader:
+    """Template matcher for the score counter's own digits."""
+
+    def __init__(self, templates: dict[int, list[np.ndarray]]) -> None:
+        self.templates = {d: [t.astype(np.uint8) for t in v]
+                          for d, v in templates.items()}
+
+    @classmethod
+    def load(cls, directory: Path = TEMPLATES_DIR / "score") -> "ScoreReader":
+        """Load every saved variant of each digit.
+
+        The counter redraws at slightly different sub-pixel offsets, so one
+        template per digit is not enough to match reliably.
+        """
+        templates: dict[int, list[np.ndarray]] = {}
+        for digit in SCORE_DIGITS:
+            for path in sorted(directory.glob(f"{digit}_*.png")):
+                templates.setdefault(digit, []).append(
+                    cv2.imread(str(path), cv2.IMREAD_GRAYSCALE))
+        if not templates:
+            raise FileNotFoundError(
+                f"no score templates in {directory} - run `python calibrate.py --score`"
+            )
+        return cls(templates)
+
+    def match(self, glyph: np.ndarray) -> tuple[int, float]:
+        best, score = 0, -1.0
+        for digit, variants in self.templates.items():
+            for template in variants:
+                value = float(
+                    cv2.matchTemplate(glyph, template, cv2.TM_CCOEFF_NORMED)[0, 0])
+                if value > score:
+                    best, score = digit, value
+        return best, score
+
+
+def read_score(image: np.ndarray, reader: ScoreReader) -> int | None:
+    """The score the game is showing, or None if the counter is unreadable."""
+    glyphs = score_glyphs(image)
+    if not glyphs:
+        return None
+    digits = []
+    for glyph in glyphs:
+        digit, confidence = reader.match(glyph)
+        if confidence < MIN_MATCH_SCORE:
+            return None
+        digits.append(str(digit))
+    return int("".join(digits))
 
 
 # --------------------------------------------------------------------------

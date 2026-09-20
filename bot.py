@@ -37,8 +37,10 @@ DEBUG_DIR = ROOT / "debug"
 DRAG_STEPS = 24
 EXECUTE_SECONDS_PER_MOVE = 0.42    # measured cost of one drag at DRAG_STEPS
 SETTLE_TIMEOUT = 2.0       # hard cap on waiting for the screen to stop moving
-SETTLE_GAP_MS = 60         # spacing between the frames compared for stability
-SETTLE_STABLE = 0.35       # the board must hold still this long to count as settled
+SETTLE_GAP_MS = 50         # spacing between the frames compared for stability
+SETTLE_STABLE = 0.25       # the board must hold still this long to count as settled
+BADGE_TIMEOUT = 1.5        # hard cap on waiting for a score badge to fly away
+MOVE_ATTEMPTS = 3          # drags per move before giving up on it
 
 
 @dataclass
@@ -217,8 +219,14 @@ def read_settled(
     steady_since: float | None = None
     while True:
         image = session.screenshot()
-        grid = vision.apple_grid(image, cal)
         now = time.perf_counter()
+        if vision.popup_present(image) and now < deadline:
+            # A score badge is flying over the board; anything under it misreads.
+            previous, steady_since = None, None
+            assert session.page is not None
+            session.page.wait_for_timeout(SETTLE_GAP_MS)
+            continue
+        grid = vision.apple_grid(image, cal)
         if previous is not None and np.array_equal(grid, previous):
             steady_since = steady_since or now
             if now - steady_since >= SETTLE_STABLE:
@@ -230,6 +238,49 @@ def read_settled(
         previous = grid
         assert session.page is not None
         session.page.wait_for_timeout(SETTLE_GAP_MS)
+
+
+def wait_for_badge(session: GameSession, timeout: float = BADGE_TIMEOUT) -> None:
+    """Hold off until no score badge is in flight.
+
+    Badges are drawn over the board, and a drag that starts under one is
+    swallowed - the single biggest cause of a plan executing short. In the
+    normal path :func:`read_settled` has already waited the badge out before
+    the next drag, so this is only needed on a retry.
+    """
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if not vision.popup_present(session.screenshot()):
+            return
+        assert session.page is not None
+        session.page.wait_for_timeout(SETTLE_GAP_MS)
+
+
+def execute_move(
+    session: GameSession,
+    cal: vision.Calibration,
+    reader: vision.DigitReader,
+    move: solver.Move,
+    expected: solver.Board,
+) -> tuple[bool, int, vision.BoardReading]:
+    """Drag ``move`` and confirm the board matches ``expected`` afterwards.
+
+    Drags are not perfectly reliable, and one silently dropped drag invalidates
+    every later move in the plan, so each one is checked and retried. Returns
+    (landed, attempts, the reading it settled on).
+    """
+    for attempt in range(1, MOVE_ATTEMPTS + 1):
+        if attempt > 1:
+            wait_for_badge(session)      # only needed when retrying
+        session.drag(move, cal)
+        reading, _ = read_settled(session, cal, reader)
+        if np.array_equal(reading.board, expected):
+            return True, attempt, reading
+        if reading.apples != solver.remaining_apples(expected) + move.apples:
+            # Something changed, but not what we asked for: repeating the drag
+            # would be guesswork, so let the caller re-read and replan.
+            return False, attempt, reading
+    return False, MOVE_ATTEMPTS, reading
 
 
 def make_plan(
@@ -279,9 +330,51 @@ def run_dry(args: argparse.Namespace) -> None:
         hold_window(session, args)
 
 
+def affordable_moves(
+    moves: list[solver.Move], deadline: float, move_cost: float
+) -> int:
+    """How many of ``moves`` the clock can actually execute."""
+    left = deadline - time.perf_counter()
+    return max(0, min(len(moves), int(left / move_cost)))
+
+
+def describe_diff(expected: solver.Board, observed: solver.Board) -> list[tuple]:
+    """Cells where the two boards disagree, as (row, col, expected, observed)."""
+    return [(int(r), int(c), int(expected[r, c]), int(observed[r, c]))
+            for r, c in np.argwhere(expected != observed)]
+
+
+def classify(move: solver.Move, diff: list[tuple]) -> str:
+    """Best guess at why the board is not where the plan says it should be."""
+    if not diff:
+        return "none"
+    def in_move(r: int, c: int) -> bool:
+        return move.r1 <= r <= move.r2 and move.c1 <= c <= move.c2
+
+    # A cell that still holds an apple but a *different* digit was never about
+    # this drag at all - the initial parse was wrong. Check that first, because
+    # such a cell can sit anywhere on the board.
+    if any(e != 0 and o != 0 and e != o for _, _, e, o in diff):
+        return "vision misread (digit differs)"
+    if any(not in_move(r, c) for r, c, _, _ in diff):
+        # Cells beyond the drag rectangle changed: the box took in a neighbour.
+        return "drag geometry (changed outside the rectangle)"
+    if all(e == 0 and o != 0 for _, _, e, o in diff):
+        # The target apples are still on screen: the game never saw the drag.
+        return "dropped drag (nothing cleared)"
+    return "tracking bug (unexplained)"
+
+
 def run_play(args: argparse.Namespace) -> None:
     reader = vision.DigitReader.load()
+    score_reader: vision.ScoreReader | None
+    try:
+        score_reader = vision.ScoreReader.load()
+    except FileNotFoundError:
+        score_reader = None
+        print("note: no score templates, cannot read the on-screen counter")
     rng = random.Random(args.seed)
+
     with GameSession(headless=args.headless) as session:
         session.press_play()
         started = time.perf_counter()
@@ -290,28 +383,38 @@ def run_play(args: argparse.Namespace) -> None:
         deadline = started + args.time_limit
 
         reading = vision.read_board(image, cal, reader)
-        board = reading.board                 # what we believe is on screen
+        board = reading.board
         print(solver.board_to_str(board))
         if reading.apples != solver.ROWS * solver.COLS:
             print(f"warning: only read {reading.apples}/170 apples")
 
         budget = min(args.plan_budget, deadline - time.perf_counter())
         plan = make_plan(board, budget, args, rng)
-        print(f"\nplanned {len(plan)} moves for {plan.score} in {plan.elapsed:.1f}s")
+        print(f"\nplanned {len(plan)} moves scoring {plan.score} "
+              f"in {plan.elapsed:.1f}s")
 
+        # Promising the whole plan is dishonest if the clock cannot execute it,
+        # so the prediction covers only the prefix that fits. The per-move cost
+        # is re-measured as we go.
+        move_cost = args.move_cost
         queue = list(plan.moves)
-        executed = replans = dropped = 0
+        affordable = affordable_moves(plan.moves, deadline, move_cost)
+        if affordable < len(plan.moves):
+            print(f"  only {affordable} of {len(plan)} moves fit in the "
+                  f"remaining {deadline - time.perf_counter():.0f}s at "
+                  f"{move_cost:.2f}s per move")
+            queue = queue[:affordable]
+        predicted = sum(m.apples for m in queue)
+        executed = replans = retries = 0
+        first_divergence: tuple | None = None
         since_check = 0
 
         while time.perf_counter() < deadline:
             if not queue:
-                # Either the plan ran out or a replan emptied it. Check the
-                # screen; if anything is still playable, plan the rest.
-                reading, image = read_settled(session, cal, reader)
+                reading, _ = read_settled(session, cal, reader)
                 board = reading.board
                 since_check = 0
-                if not solver.generate_moves(board):
-                    print("no legal moves left")
+                if not solver.generate_moves(board) or args.no_replan:
                     break
                 left = deadline - time.perf_counter()
                 if left <= args.replan_budget:
@@ -320,44 +423,72 @@ def run_play(args: argparse.Namespace) -> None:
                 if not plan.moves:
                     break
                 replans += 1
-                print(f"     replan {replans}: {len(plan)} more moves for {plan.score}")
+                predicted += plan.score
+                print(f"     replan {replans}: {len(plan)} more moves "
+                      f"for {plan.score} (prediction now {predicted})")
                 queue = list(plan.moves)
                 continue
 
             move = queue.pop(0)
-            session.drag(move, cal, steps=args.drag_steps)
-            solver.apply_move(board, move, inplace=True)
+            expected = solver.apply_move(board, move)
+            acting = time.perf_counter()
+            landed, attempts, reading = execute_move(
+                session, cal, reader, move, expected)
+            move_cost = 0.8 * move_cost + 0.2 * (time.perf_counter() - acting)
+            retries += attempts - 1
             executed += 1
             since_check += 1
-            print(f"{executed:3d}. rows {move.r1}-{move.r2} cols {move.c1}-{move.c2} "
-                  f"+{move.apples}  ({len(queue)} queued, "
-                  f"{deadline - time.perf_counter():.0f}s left)")
 
-            if since_check < args.verify_every:
+            if landed:
+                board = expected
+            else:
+                diff = describe_diff(expected, reading.board)
+                kind = classify(move, diff)
+                if first_divergence is None:
+                    first_divergence = (executed, move, diff, kind)
+                    save_divergence(session, cal, reading, move, executed, diff, kind)
+                print(f"     DIVERGENCE at move {executed} after {attempts} "
+                      f"attempts: {kind}")
+                print(f"       move rows {move.r1}-{move.r2} cols "
+                      f"{move.c1}-{move.c2} ({move.apples} apples)")
+                print(f"       cells (r,c,expected,observed): {diff[:8]}")
+                board = reading.board
+                queue = []
                 continue
-            since_check = 0
-            reading, image = read_settled(session, cal, reader)
-            if args.debug:
-                save_debug(image, reading, None, executed)
-            if np.array_equal(reading.board, board):
-                continue
-            # The screen and the plan have parted company: a drag was dropped,
-            # or landed somewhere unintended. Believe the screen.
-            off = int((reading.board != board).sum())
-            dropped += 1
-            board = reading.board
-            queue = []
-            print(f"     checkpoint at move {executed}: {off} cells differ, replanning")
+
+            print(f"{executed:3d}. rows {move.r1}-{move.r2} cols {move.c1}-{move.c2} "
+                  f"+{move.apples}{'  (retried)' if attempts > 1 else ''}  "
+                  f"({len(queue)} queued, {deadline - time.perf_counter():.0f}s left)")
+
+            if since_check >= args.verify_every:
+                since_check = 0
+                if not np.array_equal(reading.board, board):
+                    diff = describe_diff(board, reading.board)
+                    print(f"     checkpoint at move {executed}: "
+                          f"{len(diff)} cells differ: {diff[:8]}")
 
         final, image = read_settled(session, cal, reader)
         cleared = solver.ROWS * solver.COLS - final.apples
+        on_screen = vision.read_score(image, score_reader) if score_reader else None
         elapsed = time.perf_counter() - started
-        print(f"\nfinished: scored {cleared} in {elapsed:.1f}s "
-              f"({executed} moves executed, {replans} replans, "
-              f"{dropped} desyncs caught)")
+
+        print(f"\n{'=' * 62}")
+        print(f"predicted score : {predicted}")
+        print(f"on-screen score : {on_screen if on_screen is not None else 'unreadable'}")
+        print(f"apples cleared  : {cleared}")
+        exact = on_screen == predicted
+        print(f"result          : {'EXACT MATCH' if exact else 'SHORT by ' + str(predicted - (on_screen if on_screen is not None else 0))}")
+        print(f"moves executed  : {executed} ({retries} drag retries, {replans} replans)")
+        if first_divergence:
+            index, move, diff, kind = first_divergence
+            print(f"first divergence: move {index}, {kind}")
+        else:
+            print("first divergence: none")
+        print(f"elapsed         : {elapsed:.1f}s of the {args.time_limit:.0f}s limit")
+        print("=" * 62)
+
         if args.debug:
             save_debug(image, final, None, 999)
-
         if not args.headless:
             wait_out_clock(session, started + GAME_SECONDS)
             if args.debug:
@@ -365,6 +496,23 @@ def run_play(args: argparse.Namespace) -> None:
                 cv2.imwrite(str(DEBUG_DIR / "score_screen.png"),
                             session.screenshot(lossless=True))
         hold_window(session, args)
+
+
+def save_divergence(
+    session: GameSession,
+    cal: vision.Calibration,
+    observed: vision.BoardReading,
+    move: solver.Move,
+    index: int,
+    diff: list[tuple],
+    kind: str,
+) -> None:
+    """Save an annotated picture of the board where the plan came apart."""
+    DEBUG_DIR.mkdir(exist_ok=True)
+    caption = f"move {index}: {kind} | {len(diff)} cells differ"
+    image = session.screenshot(lossless=True)
+    cv2.imwrite(str(DEBUG_DIR / f"divergence_{index:03d}.png"),
+                vision.annotate(image, observed, move, caption))
 
 
 def wait_out_clock(session: GameSession, deadline: float) -> None:
@@ -429,6 +577,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="seconds to spend planning the opening line")
     parser.add_argument("--replan-budget", type=float, default=3.0,
                         help="seconds to spend replanning after a desync")
+    parser.add_argument("--move-cost", type=float, default=1.05,
+                        help="initial estimate of seconds to execute one move")
+    parser.add_argument("--no-replan", action="store_true",
+                        help="stop when the plan ends instead of replanning")
     parser.add_argument("--verify-every", type=int, default=10,
                         help="check the screen against the plan every N moves")
     parser.add_argument("--time-limit", type=float, default=110.0,

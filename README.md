@@ -155,6 +155,60 @@ scored 134/157/123, and at `--verify-every 5` scored 131/142/167. That is
 suggestive rather than conclusive at three games a side, but it points the same
 way as the sweep.
 
+### The game is deterministic, so the plan must come true
+
+A correctly executed plan scores exactly what it predicted. Any shortfall means
+the model of the game is wrong somewhere, so the bot states its prediction up
+front and checks it against the game's own score counter at the end:
+
+```
+predicted score : 137
+on-screen score : 137
+result          : EXACT MATCH
+moves executed  : 63 (0 drag retries, 0 replans)
+first divergence: none
+```
+
+Getting there turned up three wrong assumptions, two of them invisible in the
+score alone:
+
+1. **The flying score badge.** Clearing apples sends a "+N" badge arcing from
+   them to the counter, *drawn over the board*. Any cell it crosses parses as
+   empty or as the wrong digit. Worse, a drag that starts under a badge is
+   swallowed. This was the main cause of both phantom divergences and lost
+   moves. The badge has a yellow outline and a settled board contains no yellow
+   at all, so `popup_present` is an exact test; frames containing one are never
+   parsed, and drags wait for it to pass.
+2. **Drags are not perfectly reliable.** Roughly one drag a game is dropped even
+   with the badge handled, and because every later move assumes the earlier
+   clears happened, one dropped drag can cost twenty points. Each move is now
+   confirmed against the expected board and retried.
+3. **The clock is part of the model.** Executing a move costs about 1.5s, so a
+   70-move plan does not fit in 110s. Predicting the whole plan's score was
+   dishonest; the bot now promises only the prefix the clock can reach.
+
+What turned out to be *right* was the simulator's geometry - see below.
+
+### How the game decides an apple is selected
+
+Measured rather than assumed, by dragging boxes that extend `m` pixels past the
+apple centres of a pair summing to 10 and seeing whether they clear:
+
+| m | 0 | 5 | 20 | 33 | 45 | 55 | 64 | 66 | 68 | 70 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| clears | no | yes | yes | yes | yes | yes | yes | **no** | no | no |
+
+Apples are 50px wide on a 66px pitch. A box only 10px across still selects both
+apples, which rules out **full containment**; it still clears at m=45, well past
+the neighbour's sprite edge at 41px, which rules out **any overlap**. The cut-off
+is exactly 66px - the neighbour's centre.
+
+So the game selects an apple **if and only if its centre lies inside the drag
+box**, which is precisely what a rectangle of cells means. The simulator was
+already correct, and the bot's drags - which run from gap midpoint to gap
+midpoint, 33px clear of the nearest neighbouring centre - have the maximum
+possible margin.
+
 ### Playing the board reliably
 
 These were all found the hard way:

@@ -80,6 +80,94 @@ def save_sheet(rep_glyphs: list[np.ndarray], path: Path) -> None:
     cv2.imwrite(str(path), 255 - sheet)
 
 
+SCORE_GLYPH_CACHE = Path("score_glyphs.npz")
+
+
+def calibrate_score(args: argparse.Namespace) -> None:
+    """Harvest the score counter's own digits by playing a game and watching it.
+
+    Harvesting and labelling are separate steps on purpose: the clusters come
+    out in a different order every run, so labels from one run would be wrong
+    for the next. Harvest once, look at the sheet, then label the cache.
+    """
+    import random
+
+    import bot                                  # imported lazily: needs playwright
+
+    if args.from_cache:
+        data = np.load(SCORE_GLYPH_CACHE)
+        reps = [data[k] for k in sorted(data.files, key=lambda k: int(k.split("_")[1]))]
+        counts = [0] * len(reps)
+        print(f"loaded {len(reps)} cached clusters from {SCORE_GLYPH_CACHE}")
+        _label_and_save(reps, counts, args)
+        return
+
+    reader = vision.DigitReader.load()
+    glyphs: list[np.ndarray] = []
+    for game in range(args.games):
+        with bot.GameSession(headless=args.headless) as session:
+            session.press_play()
+            image, _ = session.wait_for_board()
+            cal = vision.Calibration.load()
+            board = vision.read_board(image, cal, reader).board
+            plan = solver.plan(board, 3.0, random.Random(game))
+            for move in plan.moves:
+                session.drag(move, cal, steps=bot.DRAG_STEPS)
+                # The counter pops when it updates and the badge flies over it,
+                # so only harvest once two consecutive frames agree exactly.
+                previous = None
+                for _ in range(6):
+                    session.page.wait_for_timeout(90)
+                    shot = session.screenshot()
+                    if vision.popup_present(shot):
+                        previous = None
+                        continue
+                    current = vision.score_mask(shot)
+                    if previous is not None and np.array_equal(current, previous):
+                        glyphs.extend(vision.score_glyphs(shot))
+                        break
+                    previous = current
+        print(f"  game {game}: {len(glyphs)} glyphs so far", flush=True)
+    print(f"collected {len(glyphs)} score digit glyphs")
+
+    reps, labels = cluster_glyphs(glyphs)
+    counts = [labels.count(i) for i in range(len(reps))]
+    print(f"grouped into {len(reps)} distinct digits")
+    np.savez(SCORE_GLYPH_CACHE, **{f"g_{i}": g for i, g in enumerate(reps)})
+    print(f"cached the clusters in {SCORE_GLYPH_CACHE}")
+    _label_and_save(reps, counts, args)
+
+
+def _label_and_save(
+    reps: list[np.ndarray], counts: list[int], args: argparse.Namespace
+) -> None:
+    show_clusters(reps, counts)
+    save_sheet(reps, vision.TEMPLATES_DIR / "_score_clusters.png")
+    print(f"\ncontact sheet: {vision.TEMPLATES_DIR / '_score_clusters.png'}")
+
+    answer = args.labels or input(
+        f"type the {len(reps)} digits above, left to right ('.' to drop one): "
+    )
+    answer = answer.strip()
+    if len(answer) != len(reps) or not all(c.isdigit() or c == "." for c in answer):
+        raise SystemExit(f"expected {len(reps)} characters, got {answer!r}")
+    if args.dry_run:
+        print("dry run: nothing written")
+        return
+    out = vision.TEMPLATES_DIR / "score"
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.glob("*.png"):
+        old.unlink()
+    # The counter redraws at different sub-pixel offsets, so a digit can appear
+    # as several distinct clusters. Keep every variant.
+    for index, (glyph, digit) in enumerate(zip(reps, answer)):
+        if digit == ".":
+            continue
+        cv2.imwrite(str(out / f"{digit}_{index}.png"), glyph)
+    kept = sorted({c for c in answer if c != "."})
+    print(f"saved score templates for digits {''.join(kept)} to {out}/")
+
+
 def grab_screenshot(headless: bool) -> np.ndarray:
     import bot                                   # imported lazily: needs playwright
 
@@ -98,7 +186,16 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be saved, write nothing")
+    parser.add_argument("--score", action="store_true",
+                        help="calibrate the on-screen score counter instead")
+    parser.add_argument("--games", type=int, default=2,
+                        help="games to play while harvesting score digits")
+    parser.add_argument("--from-cache", action="store_true",
+                        help="label the clusters cached by a previous --score run")
     args = parser.parse_args()
+    if args.score:
+        calibrate_score(args)
+        return
 
     image = cv2.imread(str(args.image)) if args.image else grab_screenshot(args.headless)
     if image is None:
