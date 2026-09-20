@@ -126,7 +126,34 @@ the game's 120s for the score screen.
 ```bash
 python bot.py --plan-budget 40      # spend longer on the opening plan
 python bot.py --verify-every 5      # check the screen more often
+python benchmark.py --plan-sweep    # mean score vs planning budget
 ```
+
+### How much planning is worth it
+
+`benchmark.py --plan-sweep` scores a whole-game plan at each budget over 40
+random boards plus the fixture:
+
+| budget | mean | gain | median | max | exec | total | fixture |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1s | 134.3 | - | 134 | 164 | 26s | 27s | 146 |
+| 3s | 134.2 | -0.1 | 134 | 163 | 26s | 29s | 148 |
+| 5s | 135.8 | +1.6 | 136 | 163 | 26s | 31s | 146 |
+| 10s | 135.5 | -0.3 | 136 | 158 | 26s | 36s | 149 |
+| 20s | 136.6 | +1.1 | 137 | 163 | 26s | 46s | 150 |
+| 40s | 137.8 | +1.2 | 136 | 169 | 26s | 66s | 151 |
+| 60s | 138.3 | +0.6 | 138 | 167 | 27s | 87s | 153 |
+
+The curve is almost flat: sixty times the compute buys four points, and every
+budget fits inside the 110s limit. Searching a whole game from the opening
+position saturates early - most of what a long search finds is a line that
+reality will not follow anyway.
+
+So the leftover clock is better spent replanning from where the board actually
+is than on a longer opening plan. Three live games each at `--verify-every 10`
+scored 134/157/123, and at `--verify-every 5` scored 131/142/167. That is
+suggestive rather than conclusive at three games a side, but it points the same
+way as the sweep.
 
 ### Playing the board reliably
 
