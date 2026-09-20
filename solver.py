@@ -498,6 +498,36 @@ class SimResult:
         return self.elapsed / len(self.moves) if self.moves else 0.0
 
 
+@dataclass
+class Plan:
+    """A complete line of play worked out ahead of time."""
+
+    moves: list[Move]
+    score: int
+    elapsed: float
+
+    def __len__(self) -> int:
+        return len(self.moves)
+
+
+def plan(
+    board: Board,
+    budget: float,
+    rng: random.Random | None = None,
+    *,
+    alpha: float = 12.0,
+) -> Plan:
+    """Search for ``budget`` seconds and return a whole move sequence.
+
+    This is the same rollout search the move-at-a-time strategy uses, run to
+    the end of the game in one go: the search spends its budget across the
+    moves it expects to make and hands back the line it settled on.
+    """
+    strategy = Rollout(time_budget=max(budget, 0.05), total_budget=budget, alpha=alpha)
+    result = simulate(board, strategy, rng)
+    return Plan(moves=result.moves, score=result.score, elapsed=result.elapsed)
+
+
 def simulate(
     board: Board,
     strategy: Strategy,

@@ -20,3 +20,4 @@ debug/
 cells/
 *.log
 templates/_clusters.png
+plan_sweep.csv

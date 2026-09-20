@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import time
+import argparse
+import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -48,49 +50,70 @@ def test_drag_points_land_in_the_gaps_between_apples() -> None:
 
 
 # --------------------------------------------------------------------------
-# Time budgeting
+# Planning and execution
 # --------------------------------------------------------------------------
 
-def test_moves_remaining_is_capped_by_both_estimates() -> None:
-    full = np.full((solver.ROWS, solver.COLS), 5, dtype=np.int8)
-    # Early on, the whole-game move estimate is the binding one.
-    assert bot.moves_remaining(full, played=0) == float(bot.EXPECTED_MOVES)
-    # Late on, with few apples left, apples-remaining binds instead.
-    sparse = np.zeros_like(full)
-    sparse[0, :] = 5                       # one row, so solver.COLS apples left
-    assert bot.moves_remaining(sparse, played=10) == pytest.approx(
-        solver.COLS / bot.APPLES_PER_MOVE
-    )
-    # And it never drops below a small floor.
-    assert bot.moves_remaining(np.zeros_like(full), played=99) == 3.0
+def _args(**overrides: object) -> argparse.Namespace:
+    """The CLI defaults, so tests exercise what the bot actually runs with."""
+    parser = bot.build_parser()
+    args = parser.parse_args([])
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
 
 
-def test_think_budget_reserves_time_for_dragging() -> None:
-    board = np.full((solver.ROWS, solver.COLS), 5, dtype=np.int8)
-    deadline = time.perf_counter() + 120.0
-    generous = bot.think_budget(deadline, board, played=0, overhead=0.0)
-    realistic = bot.think_budget(deadline, board, played=0, overhead=0.9)
-    assert realistic < generous
-    # 120s, minus the end reserve, minus 62 moves of overhead, over 62 moves.
-    assert realistic == pytest.approx((120 - bot.END_RESERVE - 62 * 0.9) / 62, abs=0.05)
+@pytest.fixture
+def real_board_local() -> solver.Board:
+    path = Path(__file__).parent / "fixtures" / "board_real.txt"
+    return solver.parse_board(path.read_text())
 
 
-def test_think_budget_never_returns_less_than_the_floor() -> None:
-    board = np.full((solver.ROWS, solver.COLS), 5, dtype=np.int8)
-    expired = time.perf_counter() - 10.0
-    assert bot.think_budget(expired, board, played=0, overhead=0.9, floor=0.02) == 0.02
+@pytest.mark.parametrize("strategy", ["rollout", "greedy"])
+def test_make_plan_returns_a_legal_line_to_the_end(
+    real_board_local: solver.Board, strategy: str
+) -> None:
+    plan = bot.make_plan(real_board_local, 0.3, _args(strategy=strategy),
+                         random.Random(0))
+    assert plan.moves and plan.score == sum(m.apples for m in plan.moves)
+    work = real_board_local.copy()
+    for move in plan.moves:
+        assert solver.is_legal(work, move), f"{strategy} planned illegal {move}"
+        solver.apply_move(work, move, inplace=True)
+    assert solver.generate_moves(work) == []     # the line plays to exhaustion
 
 
-def test_set_budget_retunes_a_live_strategy() -> None:
-    strategy = solver.Rollout(time_budget=1.0)
-    bot.set_budget(strategy, 0.25)
-    assert strategy.time_budget == 0.25
-    greedy = solver.GreedyFewest()
-    bot.set_budget(greedy, 0.25)      # no time_budget attribute: must not raise
+def test_plan_respects_its_budget(real_board_local: solver.Board) -> None:
+    plan = solver.plan(real_board_local, 0.5, random.Random(0))
+    assert plan.elapsed < 3.0
+    assert plan.score > 0
 
 
-def test_make_strategy_rejects_an_unknown_name() -> None:
-    assert isinstance(bot.make_strategy("rollout", 0.1, 12.0), solver.Rollout)
-    assert isinstance(bot.make_strategy("greedy", 0.1, 12.0), solver.GreedyFewest)
-    with pytest.raises(ValueError):
-        bot.make_strategy("nope", 0.1, 12.0)
+def test_a_dropped_move_is_visible_at_the_next_checkpoint(
+    real_board_local: solver.Board,
+) -> None:
+    """The checkpoint contract: skipping one drag must change the board."""
+    plan = solver.plan(real_board_local, 0.2, random.Random(0))
+    assert len(plan.moves) > bot.DRAG_STEPS // 4
+
+    expected = real_board_local.copy()
+    actual = real_board_local.copy()
+    for i, move in enumerate(plan.moves[:10]):
+        solver.apply_move(expected, move, inplace=True)
+        if i != 3:                      # the game dropped move 3
+            solver.apply_move(actual, move, inplace=True)
+
+    assert not np.array_equal(actual, expected)
+    assert solver.remaining_apples(actual) > solver.remaining_apples(expected)
+
+
+def test_default_budgets_fit_inside_the_time_limit() -> None:
+    """Planning plus dragging a whole game must leave headroom on the clock."""
+    args = _args()
+    typical_moves = 70          # a long game; most are shorter
+    estimate = args.plan_budget + typical_moves * bot.EXECUTE_SECONDS_PER_MOVE
+    assert estimate < args.time_limit
+    assert args.time_limit < bot.GAME_SECONDS     # room for the score screen
+
+
+def test_verify_every_is_positive() -> None:
+    assert _args().verify_every >= 1

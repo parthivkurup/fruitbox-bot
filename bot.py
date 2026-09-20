@@ -1,8 +1,10 @@
 """Play Fruit Box in a real browser.
 
-Opens the game in headed Chromium, presses Play, then loops: screenshot the
-canvas -> parse the board -> pick a move -> drag it -> wait for the clear
-animation. Stops when no legal move remains or the 120 second clock runs out.
+Plan then execute: open the game in headed Chromium, press Play, read the board
+once, search for a whole line of play, then drag that line out as fast as the
+game will take it. Every few moves the screen is checked against the expected
+position, and any disagreement triggers a quick replan from what is actually
+there.
 """
 
 from __future__ import annotations
@@ -27,20 +29,16 @@ GAME_SECONDS = 120.0
 ROOT = Path(__file__).resolve().parent
 DEBUG_DIR = ROOT / "debug"
 
-# Leave room for the final drag plus a safety margin when budgeting think time.
-END_RESERVE = 2.0
 # Each mouse event costs a ~17ms round trip and the game samples the pointer
-# once per frame, so drags are a trade-off: too few steps and the game drops the
-# drag entirely. The first attempt is cheap, a retry is thorough.
-DRAG_STEPS = 12
-RETRY_DRAG_STEPS = 28
-CLEAR_TIMEOUT = 1.2        # hard cap on waiting for a clear animation
-DROP_AFTER = 0.40          # board untouched for this long means the drag was dropped
-# A game runs to roughly this many moves before the board dries up, typically
-# leaving 40-50 apples stranded. Budgeting off apples-remaining alone reserves
-# time for clears that will never happen, so take whichever estimate is smaller.
-EXPECTED_MOVES = 62
-APPLES_PER_MOVE = 2.1
+# once per frame, so a drag made of too few steps is dropped outright. Measured
+# over full sequences, 24 steps executes 91-100% of a plan; fewer steps is
+# faster per drag but loses more moves, and a lost move derails everything
+# planned after it.
+DRAG_STEPS = 24
+EXECUTE_SECONDS_PER_MOVE = 0.42    # measured cost of one drag at DRAG_STEPS
+SETTLE_TIMEOUT = 2.0       # hard cap on waiting for the screen to stop moving
+SETTLE_GAP_MS = 60         # spacing between the frames compared for stability
+SETTLE_STABLE = 0.35       # the board must hold still this long to count as settled
 
 
 @dataclass
@@ -197,103 +195,52 @@ class GameSession:
 # Board reading with animation handling
 # --------------------------------------------------------------------------
 
-def wait_for_count(
+def read_settled(
     session: GameSession,
     cal: vision.Calibration,
-    expected_apples: int,
-    unchanged_apples: int | None = None,
-    timeout: float = CLEAR_TIMEOUT,
-) -> tuple[int, np.ndarray]:
-    """Poll until the apple count matches, i.e. the clear animation is done.
+    reader: vision.DigitReader,
+    timeout: float = SETTLE_TIMEOUT,
+) -> tuple[vision.BoardReading, np.ndarray]:
+    """Read the board, but only once the screen has stopped changing.
 
-    Apples fade out rather than vanishing, so a screenshot taken immediately
-    after the drag still shows them. Counting apples needs no digit matching,
-    which makes this much cheaper than a full re-read.
+    A clear animation can still be in flight several hundred milliseconds after
+    the drag, and a frame caught mid-animation misreads cells - which poisons
+    the tracked board and triggers replans that were never needed.
 
-    A clear always resolves within ~300ms, so if ``unchanged_apples`` is still
-    on screen after :data:`DROP_AFTER` the game never saw the drag and there is
-    no point waiting out the full timeout.
+    Two frames a few tens of milliseconds apart are *not* enough to prove the
+    board has stopped: apples cross the "still there" threshold at a handful of
+    discrete moments, so mid-animation frames often match by chance. The board
+    has to hold still for :data:`SETTLE_STABLE` before it is believed.
     """
-    started = time.perf_counter()
+    deadline = time.perf_counter() + timeout
+    previous: np.ndarray | None = None
+    steady_since: float | None = None
     while True:
         image = session.screenshot()
-        count = int(vision.apple_grid(image, cal).sum())
-        if count == expected_apples:
-            return count, image
-        elapsed = time.perf_counter() - started
-        if count == unchanged_apples and elapsed >= DROP_AFTER:
-            return count, image
-        if elapsed >= timeout:
-            return count, image
+        grid = vision.apple_grid(image, cal)
+        now = time.perf_counter()
+        if previous is not None and np.array_equal(grid, previous):
+            steady_since = steady_since or now
+            if now - steady_since >= SETTLE_STABLE:
+                return vision.read_board(image, cal, reader), image
+        else:
+            steady_since = None
+        if now >= deadline:
+            return vision.read_board(image, cal, reader), image
+        previous = grid
         assert session.page is not None
-        session.page.wait_for_timeout(30)
+        session.page.wait_for_timeout(SETTLE_GAP_MS)
 
 
-def play_move(
-    session: GameSession,
-    cal: vision.Calibration,
-    move: solver.Move,
-    expected_apples: int,
-    attempts: int = 3,
-) -> tuple[bool, np.ndarray]:
-    """Drag ``move`` and confirm it landed, retrying a drag the game ignored.
-
-    A dropped drag leaves the board completely untouched, which is safe to
-    repeat. Anything else means our model of the board is wrong, so we give up
-    and let the caller re-read the screen.
-    """
-    unchanged = expected_apples + move.apples
-    for attempt in range(attempts):
-        session.drag(move, cal, steps=DRAG_STEPS if attempt == 0 else RETRY_DRAG_STEPS)
-        count, image = wait_for_count(session, cal, expected_apples, unchanged)
-        if count == expected_apples:
-            return True, image
-        if count != unchanged:
-            return False, image
-    return False, image
-
-
-def moves_remaining(board: solver.Board, played: int) -> float:
-    """How many more moves this game is likely to get."""
-    by_apples = solver.remaining_apples(board) / APPLES_PER_MOVE
-    return max(3.0, min(float(EXPECTED_MOVES - played), by_apples))
-
-
-def think_budget(
-    deadline: float,
-    board: solver.Board,
-    played: int,
-    overhead: float,
-    floor: float = 0.02,
-) -> float:
-    """Split the remaining clock across the moves we still expect to make.
-
-    Dragging and re-reading cost roughly ``overhead`` seconds per move, so only
-    what is left after paying that is available for thinking.
-    """
-    left = deadline - time.perf_counter() - END_RESERVE
-    left_over = moves_remaining(board, played)
-    return max(floor, (left - left_over * overhead) / left_over)
-
-
-def make_strategy(name: str, budget: float, alpha: float) -> solver.Strategy:
-    if name == "rollout":
-        return solver.Rollout(time_budget=budget, alpha=alpha)
-    if name == "greedy":
-        return solver.GreedyFewest()
-    if name == "beam":
-        return solver.Beam(time_budget=budget)
-    raise ValueError(f"unknown strategy {name!r}")
-
-
-def set_budget(strategy: solver.Strategy, budget: float) -> None:
-    """Retune a *live* strategy's think time.
-
-    The strategy must outlive the loop - rebuilding it each move would throw
-    away the remembered line, which is most of what makes rollouts good.
-    """
-    if hasattr(strategy, "time_budget"):
-        strategy.time_budget = budget
+def make_plan(
+    board: solver.Board, budget: float, args: argparse.Namespace,
+    rng: random.Random,
+) -> solver.Plan:
+    """Search ``board`` for ``budget`` seconds and return a full line of play."""
+    if args.strategy == "greedy":
+        result = solver.simulate(board, solver.GreedyFewest(), rng)
+        return solver.Plan(result.moves, result.score, result.elapsed)
+    return solver.plan(board, budget, rng, alpha=args.alpha)
 
 
 # --------------------------------------------------------------------------
@@ -315,18 +262,20 @@ def run_dry(args: argparse.Namespace) -> None:
         if weak:
             print(f"low-confidence cells: {weak}")
 
-        strategy = make_strategy(args.strategy, args.budget, args.alpha)
-        result = solver.simulate(reading.board, strategy, random.Random(args.seed))
-        print(f"\nplanned line: {result.move_count} moves, "
-              f"score {result.score}, {result.elapsed:.1f}s of thinking")
-        for i, move in enumerate(result.moves, 1):
+        plan = make_plan(reading.board, args.plan_budget, args, random.Random(args.seed))
+        estimate = plan.elapsed + len(plan) * EXECUTE_SECONDS_PER_MOVE
+        print(f"\nplanned line: {len(plan)} moves, score {plan.score}, "
+              f"{plan.elapsed:.1f}s planning + about "
+              f"{len(plan) * EXECUTE_SECONDS_PER_MOVE:.0f}s of dragging "
+              f"= {estimate:.0f}s of the {args.time_limit:.0f}s limit")
+        for i, move in enumerate(plan.moves, 1):
             x0, y0 = cal.corner(move.r1, move.c1)
             x1, y1 = cal.corner(move.r2 + 1, move.c2 + 1)
             print(f"{i:3d}. rows {move.r1}-{move.r2} cols {move.c1}-{move.c2} "
                   f"{move.apples} apples   drag {session.to_page(x0, y0)} -> "
                   f"{session.to_page(x1, y1)}")
         if args.debug:
-            save_debug(image, reading, result.moves[0] if result.moves else None, 0)
+            save_debug(image, reading, plan.moves[0] if plan.moves else None, 0)
         hold_window(session, args)
 
 
@@ -338,73 +287,79 @@ def run_play(args: argparse.Namespace) -> None:
         started = time.perf_counter()
         image, detected = session.wait_for_board()
         cal = load_calibration(detected, args.recalibrate)
-        deadline = started + GAME_SECONDS
+        deadline = started + args.time_limit
+
         reading = vision.read_board(image, cal, reader)
-        board = reading.board
+        board = reading.board                 # what we believe is on screen
         print(solver.board_to_str(board))
         if reading.apples != solver.ROWS * solver.COLS:
             print(f"warning: only read {reading.apples}/170 apples")
 
-        score = 0
-        played = 0
-        overhead = args.overhead          # seconds of drag + re-read per move
-        strategy = make_strategy(args.strategy, args.budget, args.alpha)
-        reset = getattr(strategy, "reset", None)
-        if callable(reset):
-            reset()
-        while time.perf_counter() < deadline - END_RESERVE:
-            budget = min(think_budget(deadline, board, played, overhead, args.floor),
-                         args.budget)
-            set_budget(strategy, budget)
-            move = strategy.choose(board, rng)
-            if move is None:
-                print("no legal moves left")
-                break
-            expected = solver.remaining_apples(board) - move.apples
-            acting = time.perf_counter()
-            landed, image = play_move(session, cal, move, expected)
-            played += 1
-            if landed:
-                score += move.apples
-                board = solver.apply_move(board, move, inplace=True)
-            else:
-                print(f"  move {played}: drag did not land - re-reading the board")
-            # A full re-read costs a round of template matching, so do it on the
-            # configured interval, and always when a drag misbehaved.
-            if not landed or played % args.reread_every == 0:
-                reading = vision.read_board(image, cal, reader)
-                if reading.weakest >= vision.MIN_MATCH_SCORE:
-                    board = reading.board          # trust the screen over our model
-                    score = solver.ROWS * solver.COLS - reading.apples
-                else:
-                    print(f"  move {played}: weak digit match "
-                          f"{reading.weakest:.2f} at {reading.low_confidence_cells()}"
-                          f" - keeping the tracked board")
-                if args.debug:
-                    save_debug(image, reading, move, played)
-            # Smooth the measured overhead so the budget tracks reality.
-            overhead = 0.7 * overhead + 0.3 * (time.perf_counter() - acting)
-            gain = f"+{move.apples}" if landed else "  x"
-            print(f"{played:3d}. rows {move.r1}-{move.r2} cols {move.c1}-{move.c2} "
-                  f"{gain} = {score}  ({budget * 1000:.0f}ms think, "
-                  f"{overhead * 1000:.0f}ms overhead, "
+        budget = min(args.plan_budget, deadline - time.perf_counter())
+        plan = make_plan(board, budget, args, rng)
+        print(f"\nplanned {len(plan)} moves for {plan.score} in {plan.elapsed:.1f}s")
+
+        queue = list(plan.moves)
+        executed = replans = dropped = 0
+        since_check = 0
+
+        while time.perf_counter() < deadline:
+            if not queue:
+                # Either the plan ran out or a replan emptied it. Check the
+                # screen; if anything is still playable, plan the rest.
+                reading, image = read_settled(session, cal, reader)
+                board = reading.board
+                since_check = 0
+                if not solver.generate_moves(board):
+                    print("no legal moves left")
+                    break
+                left = deadline - time.perf_counter()
+                if left <= args.replan_budget:
+                    break
+                plan = make_plan(board, min(args.replan_budget, left), args, rng)
+                if not plan.moves:
+                    break
+                replans += 1
+                print(f"     replan {replans}: {len(plan)} more moves for {plan.score}")
+                queue = list(plan.moves)
+                continue
+
+            move = queue.pop(0)
+            session.drag(move, cal, steps=args.drag_steps)
+            solver.apply_move(board, move, inplace=True)
+            executed += 1
+            since_check += 1
+            print(f"{executed:3d}. rows {move.r1}-{move.r2} cols {move.c1}-{move.c2} "
+                  f"+{move.apples}  ({len(queue)} queued, "
                   f"{deadline - time.perf_counter():.0f}s left)")
 
-        assert session.page is not None
-        session.page.wait_for_timeout(500)      # let the last clear finish
-        image = session.screenshot()
-        final = vision.read_board(image, cal, reader)
-        # Counting apples off the board is what the game itself scores; the
-        # move-by-move tally can drift by a point or two when a drag is retried.
+            if since_check < args.verify_every:
+                continue
+            since_check = 0
+            reading, image = read_settled(session, cal, reader)
+            if args.debug:
+                save_debug(image, reading, None, executed)
+            if np.array_equal(reading.board, board):
+                continue
+            # The screen and the plan have parted company: a drag was dropped,
+            # or landed somewhere unintended. Believe the screen.
+            off = int((reading.board != board).sum())
+            dropped += 1
+            board = reading.board
+            queue = []
+            print(f"     checkpoint at move {executed}: {off} cells differ, replanning")
+
+        final, image = read_settled(session, cal, reader)
         cleared = solver.ROWS * solver.COLS - final.apples
-        drift = "" if score == cleared else f" (running tally said {score})"
-        print(f"\nfinished: {played} moves, scored {cleared}{drift} "
-              f"in {time.perf_counter() - started:.1f}s")
+        elapsed = time.perf_counter() - started
+        print(f"\nfinished: scored {cleared} in {elapsed:.1f}s "
+              f"({executed} moves executed, {replans} replans, "
+              f"{dropped} desyncs caught)")
         if args.debug:
             save_debug(image, final, None, 999)
 
         if not args.headless:
-            wait_out_clock(session, deadline)
+            wait_out_clock(session, started + GAME_SECONDS)
             if args.debug:
                 DEBUG_DIR.mkdir(exist_ok=True)
                 cv2.imwrite(str(DEBUG_DIR / "score_screen.png"),
@@ -461,7 +416,7 @@ def save_debug(
                 vision.annotate(image, reading, move, caption))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
                         help="read the board and print the plan without dragging")
@@ -469,24 +424,30 @@ def main() -> None:
                         help="save annotated screenshots to debug/")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--strategy", default="rollout",
-                        choices=["rollout", "greedy", "beam"])
-    parser.add_argument("--budget", type=float, default=2.0,
-                        help="upper bound on per-move think time (s)")
-    parser.add_argument("--floor", type=float, default=0.02,
-                        help="lower bound on per-move think time (s)")
+                        choices=["rollout", "greedy"])
+    parser.add_argument("--plan-budget", type=float, default=20.0,
+                        help="seconds to spend planning the opening line")
+    parser.add_argument("--replan-budget", type=float, default=3.0,
+                        help="seconds to spend replanning after a desync")
+    parser.add_argument("--verify-every", type=int, default=10,
+                        help="check the screen against the plan every N moves")
+    parser.add_argument("--time-limit", type=float, default=110.0,
+                        help="cap on planning plus execution (the game allows 120)")
+    parser.add_argument("--drag-steps", type=int, default=DRAG_STEPS,
+                        help="mouse positions per drag; fewer is faster, less reliable")
     parser.add_argument("--alpha", type=float, default=12.0,
                         help="rollout policy bias towards small clears")
-    parser.add_argument("--reread-every", type=int, default=1,
-                        help="re-read the board every N moves")
     parser.add_argument("--recalibrate", action="store_true",
                         help="ignore calibration.json and detect the grid live")
-    parser.add_argument("--overhead", type=float, default=0.45,
-                        help="initial estimate of drag + re-read seconds per move")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hold", type=float, default=0.0,
                         help="close the browser after this many seconds instead of "
                              "waiting for you to press Enter")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     (run_dry if args.dry_run else run_play)(args)
 
 

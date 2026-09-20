@@ -17,7 +17,7 @@ searches for a good line of play, and drags the rectangles with Playwright.
 | `solver.py` | Pure logic. Board is a 10x17 numpy array (0 = empty). Rectangle enumeration by 2D prefix sum, plus the playing strategies. |
 | `vision.py` | Reads a board from a canvas screenshot: grid calibration, digit templates, empty-cell detection. |
 | `calibrate.py` | Interactive helper: grabs a screenshot, finds the grid, and saves one template per digit. |
-| `bot.py` | Playwright driver: opens the game, starts it, reads, plans, drags, repeats. |
+| `bot.py` | Playwright driver: opens the game, plans a whole line, then drags it out, checking the screen as it goes. |
 | `benchmark.py` | Scores each strategy over the fixture board and N random boards. |
 | `tests/` | pytest suite: solver logic, plus a vision regression test against a saved canvas screenshot. |
 
@@ -111,16 +111,38 @@ it still expects to make. A game typically runs 60 moves, spends about 55
 seconds on browser work and 60 on search, and finishes when the board runs dry
 with a few seconds to spare.
 
+## Plan then execute
+
+The bot reads the board once, searches for a complete line of play, and then
+drags that line out back to back. Every `--verify-every` moves (10 by default)
+it reads the screen and compares it to where the plan says it should be; if they
+disagree it throws away the rest of the queue and replans from what is actually
+there with a short `--replan-budget` (3s).
+
+Executing a move costs about 0.42s, so a whole game of dragging is roughly 28
+seconds. `--time-limit` (110s) caps planning plus execution, leaving the rest of
+the game's 120s for the score screen.
+
+```bash
+python bot.py --plan-budget 40      # spend longer on the opening plan
+python bot.py --verify-every 5      # check the screen more often
+```
+
 ### Playing the board reliably
 
-Three things about the browser side are worth knowing, because they were all
-found the hard way:
+These were all found the hard way:
 
 - The game samples the pointer once per animation frame, so a drag made of a
   few big jumps is often dropped entirely - long thin rectangles worst of all.
-  Drags use 12 intermediate positions, and a dropped drag is retried with 28.
-- A clear resolves within about 300ms. If the board is still untouched after
-  400ms the drag was dropped, so the bot retries rather than waiting.
+  At 24 intermediate positions a whole planned line executes essentially
+  perfectly, and drags can be fired back to back with no gap between them.
+- **A clear animation can still be running half a second after the drag**, and a
+  frame caught mid-animation misreads cells. Comparing two frames a few tens of
+  milliseconds apart is not enough to prove the board has stopped - apples cross
+  the "still there" threshold at a handful of discrete moments, so mid-animation
+  frames often match by chance. `read_settled` requires the board to hold still
+  for 350ms. Getting this wrong is expensive and quiet: the tracked board is
+  poisoned, and the bot replans over and over for no reason.
 - Canvas captures use JPEG, which is about 3x faster than PNG (33ms vs 92ms)
   and parses to the same board. Calibration uses PNG.
 
