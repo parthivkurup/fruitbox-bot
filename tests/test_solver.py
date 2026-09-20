@@ -258,3 +258,43 @@ def test_remembered_line_is_actually_playable(real_board: solver.Board) -> None:
         solver.apply_move(board, move, inplace=True)
         if strategy.line:
             assert solver.replay(board, strategy.line) is not None
+
+
+# --------------------------------------------------------------------------
+# Planning within a move budget
+# --------------------------------------------------------------------------
+
+def test_plan_respects_a_move_limit(real_board: solver.Board) -> None:
+    for limit in (1, 10, 40):
+        plan = solver.plan(real_board, 0.2, random.Random(0), move_limit=limit)
+        assert len(plan.moves) <= limit
+        work = real_board.copy()
+        for move in plan.moves:
+            assert solver.is_legal(work, move)
+            solver.apply_move(work, move, inplace=True)
+
+
+def test_move_limit_optimises_apples_per_move(real_board: solver.Board) -> None:
+    """With a move budget, a long tail of small clears is worthless.
+
+    The capped search should therefore beat simply truncating an uncapped line
+    to the same length.
+    """
+    limit = 40
+    capped = solver.plan(real_board, 1.0, random.Random(0), move_limit=limit)
+    uncapped = solver.plan(real_board, 1.0, random.Random(0))
+    truncated = sum(m.apples for m in uncapped.moves[:limit])
+    assert len(capped.moves) <= limit
+    assert capped.score >= truncated
+    # And it clears more per move than the unconstrained line does overall.
+    assert capped.score / len(capped.moves) > uncapped.score / len(uncapped.moves)
+
+
+def test_playout_respects_its_limit(real_board: solver.Board) -> None:
+    policy = solver.RandomPolicy(alpha=12.0)
+    rng = random.Random(0)
+    unlimited = solver._playout(real_board, policy, rng)
+    record: list[solver.Rect] = []
+    solver._playout(real_board, policy, rng, record, limit=5)
+    assert len(record) <= 5
+    assert unlimited > 0

@@ -260,18 +260,27 @@ def _playout(
     policy: RandomPolicy,
     rng: random.Random,
     record: list[Rect] | None = None,
+    limit: int | None = None,
 ) -> int:
-    """Play a board to the end with ``policy``; return apples cleared.
+    """Play ``board`` with ``policy``; return apples cleared.
+
+    ``limit`` caps the number of moves. With a cap the goal changes: there is
+    no credit for a long tail of small clears that will never be played, so
+    what matters is apples per move, not apples in total.
 
     Apples cleared is just the drop in the apple count, so no per-move
     bookkeeping is needed unless the caller wants the sequence itself.
     """
     work = board.copy()
     before = int((work > 0).sum())
+    played = 0
     while True:
+        if limit is not None and played >= limit:
+            return before - int((work > 0).sum())
         hits, apples = _move_arrays(work)
         if hits.size == 0:
             return before - int((work > 0).sum())
+        played += 1
         k = policy._pick_index(hits, apples, rng)
         i, j = divmod(int(hits[k]), _NC)
         if record is not None:
@@ -312,6 +321,7 @@ class Rollout:
     total_budget: float | None = None   # whole-game think time, split per move
     max_playouts: int = 1_000_000
     alpha: float = 12.0                 # tuned; see README
+    move_limit: int | None = None       # stop after this many moves in total
     keep_line: bool = True
     halving: bool = True
     floor: float = 0.02
@@ -345,6 +355,11 @@ class Rollout:
     # -- search -----------------------------------------------------------
 
     def choose(self, board: Board, rng: random.Random) -> Move | None:
+        remaining = None
+        if self.move_limit is not None:
+            remaining = self.move_limit - self.played
+            if remaining <= 0:
+                return None
         hits, apples = _move_arrays(board)
         n = hits.size
         if n == 0:
@@ -360,9 +375,10 @@ class Rollout:
         best: list[Rect] = []
         best_score = -1
         if self.keep_line and self.line:
-            carried = replay(board, self.line)
+            carried_line = self.line if remaining is None else self.line[:remaining]
+            carried = replay(board, carried_line)
             if carried is not None:
-                best, best_score = list(self.line), carried
+                best, best_score = list(carried_line), carried
 
         # A playout costs about a millisecond. If the budget cannot cover one
         # per candidate there is nothing to halve, so fall back to trying the
@@ -388,7 +404,8 @@ class Rollout:
                         children[k] = self._child(board, hits, k)
                     record: list[Rect] = []
                     total = int(apples[k]) + _playout(
-                        children[k], self.policy, rng, record
+                        children[k], self.policy, rng, record,
+                        None if remaining is None else remaining - 1,
                     )
                     self.playouts += 1
                     if total > scores[k]:
@@ -516,14 +533,20 @@ def plan(
     rng: random.Random | None = None,
     *,
     alpha: float = 12.0,
+    move_limit: int | None = None,
 ) -> Plan:
     """Search for ``budget`` seconds and return a whole move sequence.
 
     This is the same rollout search the move-at-a-time strategy uses, run to
     the end of the game in one go: the search spends its budget across the
     moves it expects to make and hands back the line it settled on.
+
+    ``move_limit`` caps how many moves the line may contain. Pass the number
+    the clock can actually execute: a line that scores well but runs past the
+    buzzer is worth less than a shorter one that finishes.
     """
-    strategy = Rollout(time_budget=max(budget, 0.05), total_budget=budget, alpha=alpha)
+    strategy = Rollout(time_budget=max(budget, 0.05), total_budget=budget,
+                       alpha=alpha, move_limit=move_limit)
     result = simulate(board, strategy, rng)
     return Plan(moves=result.moves, score=result.score, elapsed=result.elapsed)
 

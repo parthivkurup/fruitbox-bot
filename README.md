@@ -183,11 +183,70 @@ score alone:
    with the badge handled, and because every later move assumes the earlier
    clears happened, one dropped drag can cost twenty points. Each move is now
    confirmed against the expected board and retried.
-3. **The clock is part of the model.** Executing a move costs about 1.5s, so a
-   70-move plan does not fit in 110s. Predicting the whole plan's score was
-   dishonest; the bot now promises only the prefix the clock can reach.
+3. **The clock is part of the model.** Executing a move used to cost about
+   1.5s, so a 70-move plan did not fit in 110s. Predicting the whole plan's
+   score was dishonest. The bot now promises only the prefix the clock can
+   reach - and the prefix is no longer shorter than the plan, see below.
 
 What turned out to be *right* was the simulator's geometry - see below.
+
+### Confirming a move costs one screenshot
+
+Confirming each move by reading the settled board cost ~1.5s per move, which
+made the bot clock-bound and forced it to truncate plans. Measuring where the
+time went:
+
+| phase | per move |
+| --- | --- |
+| confirm (umbrella) | 1135ms |
+| ... screenshots (12 per move) | 564ms |
+| ... waiting for the badge | 304ms |
+| ... waiting for the board to settle | 234ms |
+| ... decode + parse | 57ms |
+| drag | 410ms |
+
+Two measurements changed the design:
+
+- **A clipped screenshot costs the same as a full one** (35ms vs 34ms). The cost
+  is the round trip to the browser, not the pixels, so cropping to the score
+  counter saves nothing - but taking *fewer* screenshots saves everything.
+- **The score counter updates within ~40ms of the clear**, long before the badge
+  finishes flying. So the counter can confirm a move on the first screenshot,
+  with no waiting for animations at all.
+
+A move is now confirmed by one screenshot of the counter, which must read
+exactly the running total. That is both cheaper and stricter than comparing
+boards: a wrong clear shows up as the wrong number. Per-move cost fell from
+1.5s to about 0.7s, of which 432ms is the drag itself.
+
+| phase | per move |
+| --- | --- |
+| drag | 432ms |
+| screenshots (3.5 per move) | 158ms |
+| confirm | 80ms |
+| periodic checkpoint | 95ms |
+
+A full game now executes in about 41s of the 110s budget, so nothing is
+truncated. Pipelining the drags was not worth building: the drag is inherently
+serial and confirmation is only 80ms, so issuing moves ahead of their
+confirmation could save at most ~5s a game.
+
+### Planning to a move budget
+
+The planner takes `move_limit`, the number of moves the clock can still
+execute, and maximises apples *within those moves* rather than apples
+eventually. It changes what the search wants - with a budget there is no credit
+for a long tail of small clears:
+
+| move limit | moves | score | apples/move |
+| --- | --- | --- | --- |
+| none | 71 | 150 | 2.11 |
+| 60 | 60 | 137 | 2.28 |
+| 50 | 50 | 115 | 2.30 |
+| 40 | 40 | 96 | 2.40 |
+
+With confirmation down to one screenshot the limit no longer binds, but it is
+what stops a slow machine from ever truncating again.
 
 ### How the game decides an apple is selected
 
